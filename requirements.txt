@@ -1,8 +1,13 @@
-streamlit
-easyocr
-opencv-python
+streamlit==1.33.0
+easyocr==1.7.1
+opencv-python-headless==4.9.0.80
 numpy
 pillow
-pymupdf
+torch==2.0.1+cpu
+torchvision==0.15.2+cpu
+torchaudio==2.0.2+cpu
+python-poppler
+pdf2image
+
 
 

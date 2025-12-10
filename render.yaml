@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: medical-ocr
+    env: docker
+    plan: starter
+    autoDeploy: true
+    repo: https://github.com/Lakshmi-Sayyapureddy1819/medical_ocr
+    branch: main
+    dockerContext: .
+    dockerfilePath: Dockerfile
