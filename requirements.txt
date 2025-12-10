@@ -3,11 +3,8 @@ easyocr==1.7.1
 opencv-python-headless==4.9.0.80
 numpy
 pillow
-torch==2.0.1+cpu
-torchvision==0.15.2+cpu
-torchaudio==2.0.2+cpu
-python-poppler
 pdf2image
-
-
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
 

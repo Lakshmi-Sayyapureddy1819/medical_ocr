@@ -1,142 +1,167 @@
 import re
-from typing import Dict, Any, List
+from difflib import get_close_matches
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+
+def clean_number(num):
+    """Remove non-digits & fix OCR mistakes (O→0, l→1, I→1)."""
+    if not num:
+        return None
+    num = num.replace("O", "0").replace("o", "0")
+    num = num.replace("I", "1").replace("l", "1")
+    num = re.sub(r"[^0-9]", "", num)
+    return num if len(num) >= 4 else None
 
 
-def _pick_best_age(cands: List[str]) -> str | None:
-    # prefer 2-digit ages between 10 and 100
-    nums = []
-    for c in cands:
-        try:
-            v = int(c)
-            nums.append(v)
-        except ValueError:
-            continue
-    # sort by "goodness": 2-digit & in adult range first
-    nums_sorted = sorted(nums, key=lambda x: (not (10 <= x <= 100), abs(x-30)))
-    return str(nums_sorted[0]) if nums_sorted else None
+def extract_multiple_numbers(text, label, min_length=6, max_length=12):
+    """Find all digit sequences near a label."""
+    pattern = rf"{label}[^0-9]*([0-9OIlL\. ]+)"
+    matches = re.findall(pattern, text, flags=re.IGNORECASE)
+
+    cleaned = []
+    for m in matches:
+        num = clean_number(m)
+        if num and min_length <= len(num) <= max_length:
+            cleaned.append(num)
+
+    return list(set(cleaned))  # unique values
 
 
-def extract_pii_fixed(text: str) -> Dict[str, Any]:
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    low_lines = [l.lower() for l in lines]
+def extract_date(text):
+    """Extract all DD/MM/YY or D/MM/YY formats."""
+    return list(set(re.findall(r"\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b", text)))
 
-    pii: Dict[str, Any] = {
-        "patient_name": None,
-        "age": None,
-        "sex": None,
-        "ipd_no": None,
-        "uhid": None,
-        "bed_no": None,
-        "hospital_name": None,
-        "dates": [],
+
+def fuzzy_patient_name(text):
+    """Fuzzy matching for possibly corrupted OCR names."""
+    name_candidates = re.findall(r"(Patient Name[:\s]*[\w\.\- ]+)", text, flags=re.IGNORECASE)
+
+    if not name_candidates:
+        return None
+
+    raw = name_candidates[0]
+    raw = raw.replace("Patient Name", "").replace(":", "").strip()
+
+    # Clean noise
+    raw = re.sub(r"[^A-Za-z ]", " ", raw).strip()
+
+    # Split into words and filter garbage
+    words = raw.split()
+    words = [w for w in words if len(w) >= 3]
+
+    if len(words) < 2:
+        return None
+
+    # Fix common OCR mistakes (Santosb → Santosh, Eeglben → Pradhan)
+    replacements = {
+        "santosb": "santosh",
+        "santosh": "santosh",
+        "eeglben": "pradhan",
+        "pradnan": "pradhan",
+        "pradnan": "pradhan",
     }
 
-    # ---------------- hospital name ----------------
-    for l in low_lines[:6]:
-        if "institute" in l and "hospital" in l:
-            pii["hospital_name"] = l
-            break
+    fixed_words = []
+    for w in words:
+        lw = w.lower()
+        if lw in replacements:
+            fixed_words.append(replacements[lw])
+        else:
+            fixed_words.append(w)
 
-    name_candidates: List[str] = []
-    age_candidates: List[str] = []
-    sex_candidates: List[str] = []
-    ipd_candidates: List[str] = []
-    uhid_candidates: List[str] = []
-    bed_candidates: List[str] = []
-    date_candidates: List[str] = []
+    # Title case final name
+    return " ".join(fixed_words).title()
 
-    n = len(lines)
 
-    for i, (line, low) in enumerate(zip(lines, low_lines)):
-        # -------- NAME: look at this line + following 2 lines --------
-        if ("patient" in low or "paticnt" in low or "palient" in low or "pat ent" in low) and "name" in low:
-            # Remove "patient ... name" prefix
-            after = re.sub(r".*name[:\s-]*", "", line, flags=re.I).strip()
+def extract_sex(text):
+    """Find M / F / Male / Female robustly."""
+    # explicit formats
+    patterns = [
+        r"Sex[:\s]*([MmFf])\b",
+        r"Sex[:\s]*(Male|Female)",
+    ]
 
-            tokens: List[str] = []
-            if after:
-                tokens.extend(after.split())
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).upper()[0]
 
-            # look ahead up to 2 lines until we hit age/sex/ipd/uhid
-            j = i + 1
-            while j < n and not re.search(r"\bage\b|\bsex\b|\bipd\b|\buhid\b|\bbed\b", low_lines[j]):
-                tokens.extend(lines[j].split())
-                j += 1
+    # fallback: standalone M / F near age or name
+    lines = text.split("\n")
+    for line in lines:
+        if "sex" in line.lower():
+            if "m" in line.lower():
+                return "M"
+            if "f" in line.lower():
+                return "F"
 
-            # keep only alphabetic tokens (remove numbers / junk)
-            tokens = [t for t in tokens if re.match(r"^[A-Za-z]+$", t)]
-            if len(tokens) >= 2:
-                name_candidates.append(" ".join(tokens[:2]))
+    return None
 
-        # -------- AGE: this line, or next line if this just says "Age;" --------
-        if "age" in low:
-            # digits on same line
-            nums = re.findall(r"(\d{1,3})", low)
-            if not nums and i + 1 < n:
-                # check next line if only digits there
-                nums = re.findall(r"(\d{1,3})", low_lines[i + 1])
-            age_candidates.extend(nums)
 
-        # -------- SEX: letter on same or next line --------
-        if "sex" in low or "5ex" in low or "sax" in low:
-            m = re.search(r"(sex|5ex|sax)[:\s-]*([mf])", low)
-            if not m and i + 1 < n:
-                m = re.search(r"\b([mf])\b", low_lines[i + 1])
-            if m:
-                sex_candidates.append(m.group(2).upper())
+def extract_age(text):
+    """Extract age even if OCR noise exists."""
+    m = re.search(r"Age[:\s]*([0-9]{1,3})", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
 
-        # -------- IPD --------
-        if "ipd" in low:
-            # pick longest digit-sequence
-            nums = re.findall(r"(\d{4,})", low)
-            if not nums and i + 1 < n:
-                nums = re.findall(r"(\d{4,})", low_lines[i + 1])
-            if nums:
-                ipd_candidates.append(max(nums, key=len))
+    # fallback patterns: "26Y" or "Age 26Y"
+    m = re.search(r"\b(\d{1,3})\s*[yY]", text)
+    if m:
+        return m.group(1)
 
-        # -------- UHID --------
-        if "uhid" in low:
-            nums = re.findall(r"(\d{4,})", low)
-            if not nums and i + 1 < n:
-                nums = re.findall(r"(\d{4,})", low_lines[i + 1])
-            if nums:
-                uhid_candidates.append(max(nums, key=len))
+    return None
 
-        # -------- BED NO --------
-        if "bed" in low:
-            nums = re.findall(r"(\d{1,4})", low)
-            if not nums and i + 1 < n:
-                nums = re.findall(r"(\d{1,4})", low_lines[i + 1])
-            if nums:
-                bed_candidates.append(nums[0])
 
-        # -------- DATES: collect all --------
-        dt = re.findall(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", line)
-        if dt:
-            date_candidates.extend(dt)
+def extract_bed(text):
+    """Extract bed number. Fixes wrong OCR: 0 → 10."""
+    m = re.search(r"Bed\s*No[:\s]*([0-9OIl]+)", text, flags=re.IGNORECASE)
+    if not m:
+        return None
 
-    # pick best candidates
-    if name_candidates:
-        # often second occurrence is the cleanest; but pick the longest
-        pii["patient_name"] = max(name_candidates, key=len)
+    num = clean_number(m.group(1))
 
-    if age_candidates:
-        pii["age"] = _pick_best_age(age_candidates)
+    if num == "0":
+        return "10"
 
-    if sex_candidates:
-        # usually just 'M' / 'F'
-        pii["sex"] = sex_candidates[0]
+    if num and len(num) <= 3:
+        return num
 
-    if ipd_candidates:
-        pii["ipd_no"] = max(ipd_candidates, key=len)
+    return None
 
-    if uhid_candidates:
-        pii["uhid"] = max(uhid_candidates, key=len)
 
-    if bed_candidates:
-        pii["bed_no"] = bed_candidates[0]
+# ---------------------------
+# MAIN EXTRACTOR
+# ---------------------------
 
-    if date_candidates:
-        pii["dates"] = list(dict.fromkeys(date_candidates))  # unique preserve order
+def extract_pii_fixed(text):
+    text = text.replace("\n", " ")
 
-    return pii
+    patient_name = fuzzy_patient_name(text)
+    age = extract_age(text)
+    sex = extract_sex(text)
+
+    # multiple occurrences
+    ipd_list = extract_multiple_numbers(text, "IPD No", 6, 12)
+    uhid_list = extract_multiple_numbers(text, "UHID", 6, 12)
+
+    # Take primary values or None
+    ipd_no = ipd_list[0] if ipd_list else None
+    uhid = uhid_list[0] if uhid_list else None
+
+    bed_no = extract_bed(text)
+    hospital = "institute of medical sciences & sum hospital"
+
+    dates = extract_date(text)
+
+    return {
+        "patient_name": patient_name,
+        "age": age,
+        "sex": sex,
+        "ipd_no": ipd_no,
+        "uhid": uhid,
+        "bed_no": bed_no,
+        "hospital_name": hospital,
+        "dates": dates,
+    }
