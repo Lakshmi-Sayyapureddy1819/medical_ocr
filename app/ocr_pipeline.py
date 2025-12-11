@@ -1,96 +1,167 @@
+import io
+import math
 import cv2
 import numpy as np
+from PIL import Image
+
 import easyocr
 import torch
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
 from .pii_extractor import extract_pii_fixed
 
-# ---- make PyTorch + EasyOCR stable on Windows (no semaphore crash) ----
+# limit threads (Windows safe)
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-# ---- EasyOCR reader (NO workers argument) ----
-reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+# initialize EasyOCR (fallback + box detection)
+_easy_reader = None
+def get_easy_reader():
+    global _easy_reader
+    if _easy_reader is None:
+        _easy_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+    return _easy_reader
 
+# TrOCR model & processor (large handwritten)
+_trocr_processor = None
+_trocr_model = None
+def init_trocr(model_name="microsoft/trocr-large-handwritten"):
+    global _trocr_processor, _trocr_model
+    if _trocr_model is None:
+        _trocr_processor = TrOCRProcessor.from_pretrained(model_name)
+        _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name)
+        _trocr_model.to(torch.device("cpu"))
+    return _trocr_processor, _trocr_model
 
-def preprocess_image(img_bgr: np.ndarray) -> np.ndarray:
-    """
-    CLAHE + bilateral filter.
-    Good for faint handwriting and low contrast scans.
-    """
+# -------------------------
+# Preprocessing helpers
+# -------------------------
+def apply_clahe_gray(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
+    # denoise
+    den = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
+    # optional morphological opening to reduce pen noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1,1))
+    opened = cv2.morphologyEx(den, cv2.MORPH_OPEN, kernel)
+    return opened
 
-    filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
-
-    return filtered
-
-
-def crop_header_region(img_bgr: np.ndarray, top_ratio: float = 0.35) -> np.ndarray:
-    """
-    Crop only the top part of the page (where PII header lives).
-    """
-    h, w = img_bgr.shape[:2]
-    h_top = int(h * top_ratio)
-    return img_bgr[:h_top, :, :]
-
-
-def run_dual_ocr(img_bgr: np.ndarray):
-    """
-    Run OCR twice: on grayscale and enhanced.
-    Combine results.
-    """
-    enhanced = preprocess_image(img_bgr)
+def deskew_image(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    coords = np.column_stack(np.where(edges > 0))
+    if coords.shape[0] < 50:
+        return img_bgr
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    (h, w) = img_bgr.shape[:2]
+    M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+    rotated = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
 
-    r1 = reader.readtext(gray)
-    r2 = reader.readtext(enhanced)
+def crop_header(img_bgr, top_ratio=0.32):
+    h = img_bgr.shape[0]
+    return img_bgr[:int(h*top_ratio), :, :]
 
-    return r1 + r2
+# -------------------------
+# TrOCR read (PIL input)
+# -------------------------
+def trocr_read_pil(pil_img: Image.Image, max_length=512):
+    proc, model = init_trocr()
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    pixel_values = proc(images=pil_img, return_tensors="pt").pixel_values
+    pixel_values = pixel_values.to(model.device)
+    # generation params tuned for handwriting
+    generated_ids = model.generate(pixel_values, max_length=max_length, num_beams=4, early_stopping=True)
+    preds = proc.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return preds
 
+# -------------------------
+# EasyOCR read (full page)
+# -------------------------
+def easy_read(img_bgr):
+    reader = get_easy_reader()
+    try:
+        results = reader.readtext(img_bgr)
+    except Exception:
+        results = []
+    text = "\n".join([r[1] for r in results])
+    return results, text
 
-def redact_image(img_bgr: np.ndarray, ocr_results, pii_dict):
+# -------------------------
+# Pipeline: ensemble
+# -------------------------
+def run_ensemble(img_bgr: np.ndarray):
     """
-    Fill black rectangles over any OCR box whose text contains PII value.
+    Returns:
+      combined_text (header trocr + full easyocr)
+      easy_results (list of boxes)
+      header_text (str)
     """
-    redacted = img_bgr.copy()
-    pii_vals = [str(v).lower() for v in pii_dict.values() if v]
+    # deskew for whole page
+    img_d = deskew_image(img_bgr)
 
-    for (bbox, text, conf) in ocr_results:
-        t_low = text.lower()
-        if any(v in t_low for v in pii_vals):
+    # crop and preprocess header for TrOCR
+    header = crop_header(img_d)
+    header_pre = apply_clahe_gray(header)
+    header_pil = Image.fromarray(cv2.cvtColor(header_pre, cv2.COLOR_GRAY2RGB))
+
+    # TrOCR on header (handwriting)
+    header_text = ""
+    try:
+        header_text = trocr_read_pil(header_pil)
+    except Exception:
+        header_text = ""
+
+    # EasyOCR on full page for boxes and additional text
+    easy_results, easy_text = easy_read(img_d)
+
+    combined_text = (header_text + "\n" + easy_text).strip()
+    return combined_text, easy_results, header_text
+
+# -------------------------
+# Redaction
+# -------------------------
+def redact_image(img_bgr: np.ndarray, easy_results, pii_dict):
+    out = img_bgr.copy()
+    pii_vals = []
+    for v in pii_dict.values():
+        if v is None:
+            continue
+        if isinstance(v, list):
+            pii_vals += [str(x).lower() for x in v]
+        else:
+            pii_vals.append(str(v).lower())
+    pii_vals = [p for p in pii_vals if len(p) >= 2]
+
+    for (bbox, text, conf) in easy_results:
+        t = text.lower()
+        if any(p in t for p in pii_vals):
             pts = np.array(bbox, np.int32)
-            cv2.fillPoly(redacted, [pts], (0, 0, 0))
+            cv2.fillPoly(out, [pts], (0,0,0))
+    return out
 
-    return redacted
-
-
+# -------------------------
+# Exported: process_page
+# -------------------------
 def process_page(img_bgr: np.ndarray):
     """
-    Full OCR + PII pipeline for one page image (BGR).
+    Input: BGR numpy image
+    Returns: dict with text, pii, redacted, ocr_results, header_text
     """
-    # 1. OCR on full page
-    full_results = run_dual_ocr(img_bgr)
-    full_text = "\n".join([r[1] for r in full_results])
-
-    # 2. OCR focused on header region (top of page)
-    header_bgr = crop_header_region(img_bgr)
-    header_results = run_dual_ocr(header_bgr)
-    header_text = "\n".join([r[1] for r in header_results])
-
-    # 3. Combine header + full text
-    combined_text = header_text + "\n" + full_text
-
+    combined_text, easy_results, header_text = run_ensemble(img_bgr)
     pii = extract_pii_fixed(combined_text)
-
-    # 4. Redact
-    redacted = redact_image(img_bgr, full_results, pii)
+    redacted = redact_image(img_bgr, easy_results, pii)
 
     return {
         "text": combined_text,
         "pii": pii,
         "redacted": redacted,
-        "ocr_results": full_results,
+        "ocr_results": easy_results,
+        "header_text": header_text
     }
